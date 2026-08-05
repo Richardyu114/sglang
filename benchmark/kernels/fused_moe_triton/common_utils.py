@@ -1,3 +1,4 @@
+import itertools
 import json
 from types import SimpleNamespace
 from typing import Dict, List, TypedDict
@@ -96,6 +97,7 @@ def get_model_config(
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "KimiK25ForConditionalGeneration",
         "KimiVLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
     ]:
@@ -206,27 +208,61 @@ def get_model_config(
     }
 
 
-def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
-    configs: List[BenchmarkConfig] = []
-    waves_per_eu_range = 0
-    for num_stages in [2]:
-        for block_m in [32, 64, 128, 256]:
-            for block_k in [32, 64, 128, 256]:
-                for block_n in [16, 32, 64, 128, 256]:
-                    for num_warps in [1, 2, 4, 8]:
-                        for group_size in [1, 4, 8, 16, 32]:
-                            configs.append(
-                                {
-                                    "BLOCK_SIZE_M": block_m,
-                                    "BLOCK_SIZE_N": block_n,
-                                    "BLOCK_SIZE_K": block_k,
-                                    "GROUP_SIZE_M": group_size,
-                                    "num_warps": num_warps,
-                                    "num_stages": num_stages,
-                                    "waves_per_eu": waves_per_eu_range,
-                                }
-                            )
-    return configs
+# Search axes for the ROCm/HIP backend. Declared as data rather than nested
+# loops so that adding or narrowing an axis is a one-line change.
+#
+# matrix_instr_nonkdim and kpack are HIPOptions fields (see
+# triton/backends/amd/compiler.py); they reach the compiler because the
+# fused_moe launch sites splat the whole config dict into the kernel call, and
+# HIPBackend.parse_options() absorbs any kwarg matching a HIPOptions field.
+# Both feed the same pass: add_accelerate_matmul(pm, arch, nonkdim, kpack).
+#
+# matrix_instr_nonkdim selects the MFMA instruction shape: 16 forces
+# mfma_16x16, 0 lets the compiler choose. 32 is deliberately NOT in the space:
+# on gfx942 the compiler already picks mfma_32x32 by default, so nonkdim=32
+# measured identical to nonkdim=0 (within 0.6%, against a 0.2% noise floor) on
+# an int4_w4a16 MoE shape -- it only doubles the search cost.
+#
+# These two axes interact non-additively and the interaction changes sign with
+# the shape, so they must be searched jointly rather than one at a time. On an
+# E=384/N=256 int4_w4a16 shape, relative to (nonkdim=0, kpack=1):
+#   M=4096 : nonkdim=16 alone -4.1%, kpack=2 alone +0.9%, together +2.9%
+#   M=16384: nonkdim=16 alone +3.6%, kpack=2 alone +4.3%, together +1.5%
+# Note this contradicts the general "mfma_16x16 usually wins" guidance in AMD's
+# MI300X tuning guide, which is stated for fp16/fp8 GEMM; on the int4
+# dequantization path nonkdim=16 is a regression for half the shapes measured.
+_ROCM_SEARCH_AXES: Dict[str, List[int]] = {
+    "BLOCK_SIZE_M": [32, 64, 128, 256],
+    "BLOCK_SIZE_N": [16, 32, 64, 128, 256],
+    "BLOCK_SIZE_K": [32, 64, 128, 256],
+    "GROUP_SIZE_M": [1, 4, 8, 16, 32],
+    "num_warps": [1, 2, 4, 8],
+    "num_stages": [2],
+    "waves_per_eu": [0],
+    "matrix_instr_nonkdim": [0, 16],
+    "kpack": [1, 2],
+}
+
+
+def get_rocm_configs_compute_bound(
+    axis_overrides: Dict[str, List[int]] = None,
+) -> List[BenchmarkConfig]:
+    """Cartesian product of _ROCM_SEARCH_AXES, with any axis overridable.
+
+    An empty override list is rejected rather than honored: itertools.product
+    returns nothing if any axis is empty, so a typo'd or empty value list would
+    hand back a zero-config search space and the tuner would fall through to
+    the default config with no error.
+    """
+    axes = dict(_ROCM_SEARCH_AXES)
+    for key, values in (axis_overrides or {}).items():
+        if key not in axes:
+            raise ValueError(f"unknown search axis {key!r}; known axes: {sorted(axes)}")
+        if not values:
+            raise ValueError(f"search axis {key!r} was overridden with no values")
+        axes[key] = values
+    keys = list(axes)
+    return [dict(zip(keys, values)) for values in itertools.product(*axes.values())]
 
 
 def get_configs_compute_bound() -> List[Dict[str, int]]:
@@ -253,18 +289,47 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
     return configs
 
 
+# Key order for the emitted JSON, with a flag for whether the key is required.
+# Optional keys are emitted only when present, so a config tuned on a backend
+# that does not use them is written exactly as before.
+_CONFIG_KEY_ORDER = (
+    # Portable tile / launch parameters.
+    ("BLOCK_SIZE_M", True),
+    ("BLOCK_SIZE_N", True),
+    ("BLOCK_SIZE_K", True),
+    ("GROUP_SIZE_M", True),
+    ("num_warps", True),
+    ("num_stages", True),
+    # ROCm/HIP compiler options, consumed via HIPOptions.
+    ("waves_per_eu", False),
+    ("matrix_instr_nonkdim", False),
+    ("kpack", False),
+    # Kernel-level toggles.
+    ("USE_TMA", False),
+)
+
+_KNOWN_CONFIG_KEYS = frozenset(key for key, _ in _CONFIG_KEY_ORDER)
+
+
 def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
+    """Normalize key order for the saved config.
+
+    Any key not listed in _CONFIG_KEY_ORDER is dropped, which would silently
+    discard a parameter the user put in the search space -- the tuning run
+    would report a speedup that the saved config cannot reproduce. Raise
+    instead, so an unrecognized key is a loud failure at save time.
+    """
+    unknown = sorted(set(config) - _KNOWN_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(
+            f"config contains keys that sort_config() would drop: {unknown}. "
+            f"Add them to _CONFIG_KEY_ORDER in {__name__} so they are written "
+            f"to the tuned config file."
+        )
     return {
-        "BLOCK_SIZE_M": config["BLOCK_SIZE_M"],
-        "BLOCK_SIZE_N": config["BLOCK_SIZE_N"],
-        "BLOCK_SIZE_K": config["BLOCK_SIZE_K"],
-        "GROUP_SIZE_M": config["GROUP_SIZE_M"],
-        "num_warps": config["num_warps"],
-        "num_stages": config["num_stages"],
-        **(
-            {"waves_per_eu": config["waves_per_eu"]} if "waves_per_eu" in config else {}
-        ),
-        **({"USE_TMA": config["USE_TMA"]} if "USE_TMA" in config else {}),
+        key: config[key]
+        for key, required in _CONFIG_KEY_ORDER
+        if required or key in config
     }
 
 

@@ -17,6 +17,7 @@ from common_utils import (
     get_configs_compute_bound,
     get_default_batch_sizes,
     get_model_config,
+    get_rocm_configs_compute_bound,
     save_configs,
     sort_config,
 )
@@ -431,7 +432,23 @@ def main(args: argparse.Namespace):
                     "--search-space-file must contain a JSON list of configs"
                 )
         else:
-            search_space = get_configs_compute_bound()
+            axis_overrides = {}
+            for item in args.search_axis:
+                if "=" not in item:
+                    raise ValueError(
+                        f"--search-axis expects KEY=V1,V2 but got {item!r}"
+                    )
+                key, _, values = item.partition("=")
+                axis_overrides[key.strip()] = [
+                    int(v) for v in values.split(",") if v.strip()
+                ]
+            if axis_overrides and not is_hip():
+                raise ValueError("--search-axis is only supported on ROCm")
+            search_space = (
+                get_rocm_configs_compute_bound(axis_overrides)
+                if axis_overrides
+                else get_configs_compute_bound()
+            )
         if block_shape is not None:
             block_k = block_shape[1]
             search_space = [
@@ -439,6 +456,18 @@ def main(args: argparse.Namespace):
                 for config in search_space
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
+        # Fail here rather than inside each ray worker: tune() only asserts
+        # best_config is not None, which surfaces as an opaque assertion from a
+        # remote actor after the whole fleet has spun up.
+        if not search_space:
+            raise ValueError(
+                "search space is empty"
+                + (
+                    f" after filtering BLOCK_SIZE_K by block_shape={block_shape}"
+                    if block_shape is not None
+                    else ""
+                )
+            )
 
         filename = get_config_filename(
             E,
@@ -545,6 +574,15 @@ if __name__ == "__main__":
         "--search-space-file",
         type=str,
         help="JSON file containing an explicit list of Triton configs to evaluate with --tune.",
+    )
+    parser.add_argument(
+        "--search-axis",
+        action="append",
+        default=[],
+        metavar="KEY=V1,V2",
+        help="Override one axis of the built-in search space, e.g. "
+        "--search-axis kpack=1,2 --search-axis num_stages=1,2. Repeatable. "
+        "ROCm only; use --search-space-file to supply a fully explicit space.",
     )
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     args = parser.parse_args()
