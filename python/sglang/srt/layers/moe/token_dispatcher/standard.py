@@ -99,15 +99,24 @@ class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
-        backend = get_moe_runner_backend()
+        requested_backend = get_moe_runner_backend()
+        resolved_backend = moe_runner_config.resolved_runner_backend
+        backend = resolved_backend or requested_backend
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
         self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
         # AITER fast paths can be on while the MoE runner stays Triton; only the
         # AITER runner keeps global expert IDs, so Triton must remap to local range.
-        self.use_aiter_moe_runner = backend.is_aiter() or (
-            backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
-        )
+        if resolved_backend is not None:
+            self.use_aiter_moe_runner = resolved_backend.is_aiter()
+        else:
+            # Compatibility fallback for direct dispatcher construction that
+            # did not create a MoeRunner first.
+            self.use_aiter_moe_runner = requested_backend.is_aiter() or (
+                requested_backend.is_auto()
+                and _use_aiter
+                and get_moe_a2a_backend().supports_aiter()
+            )
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global

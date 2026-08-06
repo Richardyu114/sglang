@@ -34,6 +34,10 @@ class MoeRunner:
         self.runner_backend = runner_backend
         self.config = config
         self.lora_enabled = lora_enabled
+        # Quantization methods may resolve a global ``auto`` request to a
+        # concrete backend. The dispatcher is created after this runner, so
+        # publish that decision through their shared config object.
+        config.resolved_runner_backend = runner_backend
 
         # --moe-runner-backend hpc_ops makes the standard dispatcher keep
         # global expert ids (skip_local_expert_mapping), so every MoE layer

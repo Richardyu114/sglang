@@ -51,6 +51,25 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
     return None
 
 
+def _unsupported_online_weight_update_error(model: Any) -> Optional[str]:
+    """Return a preflight error for layouts that cannot be updated in place.
+
+    Some post-load quantization paths destructively replace checkpoint loader
+    buffers with a runtime-only layout.  Their modules expose a reason through
+    ``_online_weight_update_unsupported_reason`` so all update transports can
+    fail before the first parameter is modified.
+    """
+    for module_name, module in model.named_modules():
+        reason = getattr(module, "_online_weight_update_unsupported_reason", None)
+        if reason:
+            display_name = module_name or "<root>"
+            return (
+                "Online weight updates are not supported for module "
+                f"{display_name!r}: {reason}."
+            )
+    return None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
@@ -146,6 +165,9 @@ class WeightUpdater:
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        error = _unsupported_online_weight_update_error(self.get_model())
+        if error is not None:
+            return False, error
         self._assert_weight_cache_inactive("update_weights_from_disk")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
@@ -236,6 +258,9 @@ class WeightUpdater:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
+        error = _unsupported_online_weight_update_error(self.get_model())
+        if error is not None:
+            return False, error
         self._assert_weight_cache_inactive("update_weights_from_distributed")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
@@ -321,6 +346,9 @@ class WeightUpdater:
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
+        error = _unsupported_online_weight_update_error(self.get_model())
+        if error is not None:
+            return False, error
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error
@@ -386,6 +414,9 @@ class WeightUpdater:
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
+        error = _unsupported_online_weight_update_error(self.get_model())
+        if error is not None:
+            return False, error
         self._assert_weight_cache_inactive("update_weights_from_ipc")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:

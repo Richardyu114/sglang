@@ -62,6 +62,11 @@ class MoeRunnerConfig:
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
     use_tp_all_gather_activation: bool = False
+    # The server argument can remain ``auto`` while a quantization method
+    # resolves to a concrete runner. Dispatchers are constructed after the
+    # runner and must use the concrete backend when deciding whether expert
+    # IDs stay global (AITER) or are remapped to the local range (Triton).
+    resolved_runner_backend: Optional[MoeRunnerBackend] = None
 
 
 @dataclass

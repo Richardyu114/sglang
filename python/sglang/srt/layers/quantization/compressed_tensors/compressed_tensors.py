@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -30,7 +31,12 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
-from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe import (
+    MoeA2ABackend,
+    MoeRunnerConfig,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -50,6 +56,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
+    CompressedTensorsWNA16AiterMoE,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
@@ -67,7 +74,8 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -83,6 +91,76 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsLinearMethod"]
+
+
+def _validate_aiter_w4a16_runtime(a2a_backend: MoeA2ABackend) -> None:
+    """Validate dispatch contracts required by AITER's A16WI4 kernel.
+
+    A16WI4 consumes BF16 activations.  Setting the dispatcher's quant config
+    to BF16 is sufficient for the default DeepEP/Mori configuration, but an
+    explicit CLI/environment override has higher priority in those
+    dispatchers.  Reject such overrides before allocating or repacking any
+    expert weights instead of silently treating FP8/FP4 bytes as BF16.
+    """
+    if not (a2a_backend.is_none() or a2a_backend.is_deepep() or a2a_backend.is_mori()):
+        raise ValueError(
+            "AITER W4A16 MoE supports only --moe-a2a-backend "
+            f"none, deepep, or mori; got {a2a_backend.value!r}."
+        )
+
+    moe_config = get_exec().moe
+    if moe_config.enable_eplb:
+        raise ValueError(
+            "AITER W4A16 MoE does not support --enable-eplb because its "
+            "runtime FlyDSL weight/scale layout cannot be migrated by EPLB. "
+            "Disable --enable-eplb and restart the model worker."
+        )
+    if moe_config.enable_elastic_expert_backup:
+        raise ValueError(
+            "AITER W4A16 MoE does not support "
+            "--enable-elastic-expert-backup because its runtime FlyDSL "
+            "weight/scale layout cannot be copied by the expert backup path. "
+            "Disable --enable-elastic-expert-backup and restart the model worker."
+        )
+    if getattr(moe_config, "kt_weight_path", None) is not None:
+        raise ValueError(
+            "AITER W4A16 MoE does not support --kt-weight-path because the "
+            "KTransformers expert wrapper masks CPU expert IDs with -1, which "
+            "is not a valid AITER standard-dispatch routing ID. Disable "
+            "KTransformers CPU/GPU expert splitting."
+        )
+
+    if a2a_backend.is_deepep():
+        dispatch_dtype = moe_config.deepep_dispatcher_output_dtype
+        if dispatch_dtype not in ("auto", "bf16"):
+            raise ValueError(
+                "AITER W4A16 MoE requires BF16 DeepEP dispatch, but "
+                "--deepep-dispatcher-output-dtype is set to "
+                f"{dispatch_dtype!r}. Use 'auto' or 'bf16'."
+            )
+
+    if a2a_backend.is_mori():
+        dispatch_dtype_env = "SGLANG_MORI_DISPATCH_DTYPE"
+        if dispatch_dtype_env in os.environ:
+            dispatch_dtype = os.environ[dispatch_dtype_env].lower()
+            if dispatch_dtype not in ("auto", "bf16"):
+                raise ValueError(
+                    "AITER W4A16 MoE requires BF16 Mori dispatch, but "
+                    f"{dispatch_dtype_env} is set to {dispatch_dtype!r}. "
+                    "Use 'auto' or 'bf16'."
+                )
+        else:
+            # Mirror Mori's precedence: deprecated flags are ignored whenever
+            # SGLANG_MORI_DISPATCH_DTYPE is present, including when it is auto.
+            for legacy_env in ("SGLANG_MORI_FP8_DISP", "SGLANG_MORI_FP4_DISP"):
+                if get_bool_env_var(legacy_env, "False"):
+                    raise ValueError(
+                        "AITER W4A16 MoE requires BF16 Mori dispatch, but "
+                        f"deprecated {legacy_env}=1 requests a quantized "
+                        "dispatch. Unset it or set "
+                        "SGLANG_MORI_DISPATCH_DTYPE=bf16."
+                    )
+
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
@@ -764,6 +842,17 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
                     return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
                 elif _is_hip:
+                    moe_backend = get_moe_runner_backend()
+                    if moe_backend.is_aiter():
+                        a2a_backend = get_moe_a2a_backend()
+                        _validate_aiter_w4a16_runtime(a2a_backend)
+                        logger.warning_once(
+                            "Using experimental AITER FlyDSL W4A16 MoE on ROCm. "
+                            "This path is not yet upstream-validated on gfx942/MI325X."
+                        )
+                        return CompressedTensorsWNA16AiterMoE(
+                            self, weight_quant=weight_quant
+                        )
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(
                         self, weight_quant=weight_quant

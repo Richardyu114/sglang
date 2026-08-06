@@ -1100,6 +1100,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
+                    "CompressedTensorsWNA16AiterMoE",
                     "CompressedTensorsWNA16TritonMoE",
                 ]
             )
@@ -1353,6 +1354,7 @@ class FusedMoE(torch.nn.Module):
                 method.__class__.__name__
                 in [
                     "CompressedTensorsWNA16MoE",
+                    "CompressedTensorsWNA16AiterMoE",
                     "CompressedTensorsWNA16TritonMoE",
                 ]
             )

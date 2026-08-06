@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from compressed_tensors import CompressionFormat
+from compressed_tensors.quantization import QuantizationType
 
 from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
     gptq_marlin_moe_repack,
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CompressedTensorsWNA16MoE",
+    "CompressedTensorsWNA16AiterMoE",
     "CompressedTensorsWNA16TritonMoE",
     "NPUCompressedTensorsW4A16Int4DynamicMoE",
 ]
@@ -562,6 +564,313 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
+
+
+class CompressedTensorsWNA16AiterMoE(CompressedTensorsWNA16MoE):
+    """AITER FlyDSL W4A16 MoE for symmetric, group-size-32 INT4 weights.
+
+    Compressed-tensors loads GPTQ-packed weights as ``[E, K // 8, N]``
+    int32 tensors. AITER's A16WI4 kernels consume signed, preshuffled INT4
+    weights in physical ``[E, N, K // 2]`` layout and a matching packed BF16
+    scale layout. The AITER and Triton physical layouts are not interchangeable.
+    """
+
+    # Bound the largest unpacked INT8 temporary per conversion chunk. A full
+    # Kimi expert tensor is too large to unpack for all experts at once.
+    _REPACK_CHUNK_LOGICAL_ELEMENTS = 64 * 1024 * 1024
+    _ONLINE_WEIGHT_UPDATE_UNSUPPORTED_REASON = (
+        "compressed-tensors AITER W4A16 expert weights have been converted "
+        "from checkpoint INT32 packing to the FlyDSL i4x2 layout; restart "
+        "the model worker to load different weights"
+    )
+
+    def __init__(
+        self,
+        quant_config: CompressedTensorsConfig,
+        weight_quant: QuantizationArgs,
+        num_gpu_experts: int = -1,
+    ):
+        super().__init__(quant_config, weight_quant, num_gpu_experts)
+        self.weight_type = weight_quant.type
+
+        if not _use_aiter:
+            raise ValueError(
+                "AITER W4A16 MoE requires ROCm and SGLANG_USE_AITER=1. "
+                "Set SGLANG_USE_AITER=1 and use --moe-runner-backend aiter."
+            )
+        if not (
+            self.num_bits == 4
+            and self.weight_type == QuantizationType.INT
+            and self.strategy == "group"
+            and self.group_size == 32
+            and self.sym
+            and self.actorder in (None, "static")
+        ):
+            raise ValueError(
+                "AITER W4A16 MoE only supports symmetric INT4 group "
+                "quantization with group_size=32 and no grouped actorder; got "
+                f"num_bits={self.num_bits}, type={self.weight_type.value!r}, "
+                f"strategy={self.strategy!r}, "
+                f"group_size={self.group_size}, symmetric={self.sym}, "
+                f"actorder={self.actorder!r}."
+            )
+
+        try:
+            from aiter.ops.flydsl.utils import is_flydsl_available
+            from aiter.ops.shuffle import (
+                pack_int8_to_packed_int4,
+                shuffle_scale_for_int4,
+                shuffle_weight,
+            )
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "The installed AITER does not provide the A16WI4 FlyDSL "
+                "weight/scale conversion APIs. Install an AITER build with "
+                "pack_int8_to_packed_int4 and shuffle_scale_for_int4 support."
+            ) from exc
+
+        # The conversion imports these lazily again so importing SGLang does
+        # not require AITER unless this scheme is actually selected.
+        del pack_int8_to_packed_int4, shuffle_scale_for_int4, shuffle_weight
+        if not is_flydsl_available():
+            raise RuntimeError(
+                "AITER A16WI4 MoE requires FlyDSL support for the active GPU, "
+                "but aiter.ops.flydsl.utils.is_flydsl_available() is false."
+            )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        if extra_weight_attrs.get("with_bias", False):
+            raise ValueError(
+                "AITER W4A16 compressed-tensors MoE does not support expert bias."
+            )
+        if params_dtype != torch.bfloat16:
+            raise ValueError(
+                "AITER A16WI4 MoE requires BF16 parameters/scales; got "
+                f"params_dtype={params_dtype}."
+            )
+        if hidden_size % 128 != 0 or intermediate_size_per_partition % 128 != 0:
+            raise ValueError(
+                "AITER A16WI4 FlyDSL MoE requires hidden_size and the TP-local "
+                "intermediate size to be multiples of 128; got "
+                f"hidden_size={hidden_size}, "
+                f"intermediate_size_per_partition={intermediate_size_per_partition}."
+            )
+        super().create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    @staticmethod
+    def _gptq_int32_chunk_to_aiter_i4x2(weight: torch.Tensor) -> torch.Tensor:
+        """Convert one expert chunk to AITER's preshuffled signed INT4."""
+        from aiter import dtypes
+        from aiter.ops.shuffle import pack_int8_to_packed_int4, shuffle_weight
+
+        # [E, K // 8, N] -> [E, N, K // 8]
+        transposed = weight.transpose(1, 2).contiguous()
+        num_experts, out_features, k_div_8 = transposed.shape
+
+        # compressed-tensors pack_to_int32 stores signed values with a +8
+        # uint4 bias. Restore [-8, 7] before applying AITER's preshuffle.
+        shifts = torch.arange(8, device=weight.device, dtype=torch.int32) * 4
+        nibbles = (
+            ((transposed.unsqueeze(-1) >> shifts) & 0xF)
+            .to(torch.int8)
+            .reshape(num_experts, out_features, k_div_8 * 8)
+        )
+        # The range after subtraction is exactly [-8, 7], so this can be done
+        # in-place in int8 and avoids another full-size temporary.
+        signed = nibbles.sub_(8)
+
+        shuffled = shuffle_weight(signed, layout=(16, 16))
+        packed = pack_int8_to_packed_int4(shuffled)
+        packed = packed.view(num_experts, out_features, k_div_8 * 4).contiguous()
+        return packed.view(dtypes.i4x2)
+
+    @classmethod
+    def _gptq_int32_to_aiter_i4x2(cls, weight: torch.Tensor) -> torch.Tensor:
+        """Chunked GPTQ-to-AITER conversion with a preallocated output."""
+        from aiter import dtypes
+
+        if weight.dtype != torch.int32 or weight.ndim != 3:
+            raise TypeError(
+                "Expected a three-dimensional torch.int32 GPTQ weight, got "
+                f"shape={tuple(weight.shape)}, dtype={weight.dtype}."
+            )
+
+        num_experts, k_div_8, out_features = weight.shape
+        logical_k = k_div_8 * 8
+        logical_elements_per_expert = out_features * logical_k
+        chunk_experts = max(
+            1,
+            min(
+                num_experts,
+                cls._REPACK_CHUNK_LOGICAL_ELEMENTS // logical_elements_per_expert,
+            ),
+        )
+
+        # Allocate bytes because some torch builds expose only a limited set
+        # of mutation operations for the int4 shell dtype.
+        output = torch.empty(
+            (num_experts, out_features, logical_k // 2),
+            dtype=torch.uint8,
+            device=weight.device,
+        )
+        for start in range(0, num_experts, chunk_experts):
+            end = min(start + chunk_experts, num_experts)
+            packed = cls._gptq_int32_chunk_to_aiter_i4x2(weight[start:end])
+            output[start:end].copy_(packed.view(torch.uint8))
+            del packed
+        return output.view(dtypes.i4x2)
+
+    @staticmethod
+    def _prepare_aiter_scale(scale: torch.Tensor) -> torch.Tensor:
+        from aiter.ops.shuffle import shuffle_scale_for_int4
+
+        if scale.dtype != torch.bfloat16 or scale.ndim != 3:
+            raise TypeError(
+                "AITER A16WI4 expects a BF16 scale tensor in [E, K/32, N] "
+                f"layout; got shape={tuple(scale.shape)}, dtype={scale.dtype}."
+            )
+        return shuffle_scale_for_int4(scale, group_size=32).reshape(-1).contiguous()
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_aiter_w4a16_converted", False):
+            return
+
+        with torch.no_grad():
+            w13 = self._gptq_int32_to_aiter_i4x2(layer.w13_weight_packed.data)
+            layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
+            del w13
+
+            # Rebind each large tensor immediately so the old GPTQ allocation
+            # can be released before converting the next tensor.
+            w2 = self._gptq_int32_to_aiter_i4x2(layer.w2_weight_packed.data)
+            layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
+            del w2
+
+            w13_scale = self._prepare_aiter_scale(layer.w13_weight_scale.data)
+            layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+            del w13_scale
+
+            w2_scale = self._prepare_aiter_scale(layer.w2_weight_scale.data)
+            layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+            del w2_scale
+
+            # Parameter construction and view() both drop arbitrary tensor
+            # attributes. Mark both stored tensors now and the runtime views
+            # again in get_aiter_quant_info().
+            layer.w13_weight_packed.is_shuffled = True
+            layer.w2_weight_packed.is_shuffled = True
+            layer.is_aiter_w4a16_converted = True
+            # Online loaders expect the original INT32 parameters and 3-D
+            # scales.  Mark the owning module so every online-update entry
+            # point can reject the operation before it performs a partial
+            # write into the converted i4x2/flattened buffers.
+            layer._online_weight_update_unsupported_reason = (
+                self._ONLINE_WEIGHT_UPDATE_UNSUPPORTED_REASON
+            )
+
+            # A16WI4 keeps the input and stage-1 intermediate in BF16. Prefer
+            # BF16 dispatch to avoid an otherwise redundant upscale in the
+            # existing AITER runner's quantized-dispatch compatibility path.
+            dispatcher = getattr(layer, "dispatcher", None)
+            if dispatcher is not None:
+                dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Reject reload after the destructive GPTQ-to-AITER conversion.
+
+        The inherited Marlin implementation only restores tensor shapes. This
+        scheme also changes the weight dtype to i4x2 and flattens the scales,
+        so shape-only restoration would leave invalid checkpoint destinations.
+        """
+        if getattr(layer, "is_aiter_w4a16_converted", False):
+            raise NotImplementedError(
+                "Reloading compressed-tensors AITER W4A16 MoE weights in place "
+                "is not supported because the GPTQ loader buffers have already "
+                "been converted to the FlyDSL layout. Recreate the model worker "
+                "to load a new checkpoint."
+            )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ) -> None:
+        # The normal server-argument path is rejected before allocation in
+        # _validate_aiter_w4a16_runtime(). Keep this structural check as a
+        # second line of defense in case the method is wrapped programmatically.
+        from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+
+        if isinstance(getattr(layer, "quant_method", None), KTEPWrapperMethod):
+            raise ValueError(
+                "AITER W4A16 compressed-tensors MoE does not support the "
+                "KTransformers expert wrapper because its -1 CPU-expert mask "
+                "is not a valid AITER standard-dispatch routing ID."
+            )
+        if moe_runner_config.activation != "silu":
+            raise ValueError(
+                "AITER W4A16 compressed-tensors MoE currently supports only "
+                f"SiLU, got activation={moe_runner_config.activation!r}."
+            )
+        if not moe_runner_config.is_gated:
+            raise ValueError("AITER W4A16 compressed-tensors MoE requires a gated MLP.")
+        if (
+            moe_runner_config.gemm1_alpha is not None
+            or moe_runner_config.gemm1_clamp_limit is not None
+            or moe_runner_config.swiglu_limit not in (None, 0)
+        ):
+            raise ValueError(
+                "AITER W4A16 compressed-tensors MoE currently supports only "
+                "standard SiLU(gate) * up without alpha or clamp modifiers."
+            )
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+
+    def get_aiter_quant_info(self, layer: torch.nn.Module):
+        from aiter import dtypes
+
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            AiterMoeQuantInfo,
+            AiterQuantType,
+        )
+
+        # Preserve the physical dtype marker and is_shuffled attribute on the
+        # exact views passed to aiter.fused_moe.
+        w13_weight = layer.w13_weight_packed.view(dtypes.i4x2)
+        w2_weight = layer.w2_weight_packed.view(dtypes.i4x2)
+        w13_weight.is_shuffled = True
+        w2_weight.is_shuffled = True
+
+        dispatcher = getattr(layer, "dispatcher", None)
+        expert_mask = getattr(dispatcher, "expert_mask_gpu", None)
+        return AiterMoeQuantInfo(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            quant_type=AiterQuantType.PER_1X32,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            expert_mask=expert_mask,
+            doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        return self.runner.run(dispatch_output, self.get_aiter_quant_info(layer))
 
 
 class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
