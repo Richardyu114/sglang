@@ -11,6 +11,7 @@ from sglang.benchmark.datasets.longbench_v2 import LongBenchV2Dataset
 from sglang.benchmark.datasets.mmmu import MMMUDataset
 from sglang.benchmark.datasets.mooncake import MooncakeDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
+from sglang.benchmark.datasets.prefix_cache import PrefixCacheDataset
 from sglang.benchmark.datasets.random import RandomDataset
 from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
 from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
@@ -25,6 +26,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "random": RandomDataset,
     "random-ids": RandomDataset,
     "generated-shared-prefix": GeneratedSharedPrefixDataset,
+    "prefix-cache": PrefixCacheDataset,
     "mmmu": MMMUDataset,
     "image": ImageDataset,
     "mooncake": MooncakeDataset,

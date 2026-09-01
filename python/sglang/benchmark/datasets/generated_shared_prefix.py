@@ -15,25 +15,15 @@ from transformers import PreTrainedTokenizerBase
 from sglang.benchmark.datasets.common import (
     BaseDataset,
     DatasetRow,
+    build_zipf_group_probabilities,
     compute_random_lens,
     gen_prompt,
 )
 
 
 def _zipf_group_probs(num_groups: int, alpha: float) -> np.ndarray:
-    """Rank-based Zipf probability vector with rank starting at 1.
-
-    weight(rank)      = 1 / rank ** alpha       (rank in 1..num_groups)
-    probability(rank) = weight(rank) / sum_over_all_ranks(weight)
-
-    The returned array has length num_groups; element i corresponds to
-    group index i (rank i + 1), so group 0 is the hottest.
-    """
-    if num_groups <= 0:
-        raise ValueError(f"num_groups must be > 0, got {num_groups}")
-    ranks = np.arange(1, num_groups + 1, dtype=np.float64)
-    weights = 1.0 / (ranks**alpha)
-    return weights / weights.sum()
+    """Backward-compatible alias for the shared Zipf helper."""
+    return build_zipf_group_probabilities(num_groups, alpha)
 
 
 @dataclass

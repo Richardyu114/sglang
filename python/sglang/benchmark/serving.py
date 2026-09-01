@@ -42,6 +42,10 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.datasets.prefix_cache import (
+    compute_prefix_len,
+    validate_prefix_cache_config,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -53,7 +57,7 @@ from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
-_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
+_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake", "prefix-cache"}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -83,7 +87,7 @@ def _create_bench_client_session():
 
 @dataclass
 class RequestFuncInput:
-    prompt: Union[str, List[str], List[Dict[str, str]]]
+    prompt: Union[str, List[int], List[str], List[Dict[str, str]]]
     api_url: str
     prompt_len: int
     output_len: int
@@ -995,6 +999,188 @@ def flush_server_cache(
     response.raise_for_status()
 
 
+def get_active_cache_prefixes(input_requests: List[DatasetRow]) -> List[DatasetRow]:
+    """Return one representative row for every active, non-empty cache group."""
+    groups: Dict[int, DatasetRow] = {}
+    for request in input_requests:
+        if request.cache_group_id is None or not request.cache_prefix_len:
+            continue
+
+        existing = groups.get(request.cache_group_id)
+        if existing is not None:
+            if (
+                existing.cache_prefix != request.cache_prefix
+                or existing.routing_key != request.routing_key
+            ):
+                raise ValueError(
+                    "Prefix-cache rows in the same group must share identical "
+                    f"prefix metadata; group {request.cache_group_id} differs"
+                )
+            # Text tokenization can move the prefix/suffix boundary by a token
+            # depending on the suffix. Keep the largest observed reusable LCP
+            # as the representative prompt length; the prefix payload itself
+            # is identical for every row in the group.
+            if (request.cache_prefix_len or 0) > (existing.cache_prefix_len or 0):
+                groups[request.cache_group_id] = request
+            continue
+        groups[request.cache_group_id] = request
+
+    return [groups[group_id] for group_id in sorted(groups)]
+
+
+def _prime_extra_request_body(
+    backend: str,
+    global_extra_request_body: Dict[str, Any],
+    request_extra_request_body: Dict[str, Any],
+) -> Dict[str, Any]:
+    body = {**global_extra_request_body, **request_extra_request_body}
+    if backend in ("sglang", "sglang-native"):
+        sampling_params = dict(body.get("sampling_params") or {})
+        sampling_params.update(
+            {
+                "temperature": 0.0,
+                "max_new_tokens": 1,
+                "ignore_eos": True,
+            }
+        )
+        body["sampling_params"] = sampling_params
+    else:
+        body.update({"temperature": 0.0, "ignore_eos": True})
+        if backend.endswith("-chat"):
+            body["max_completion_tokens"] = 1
+        else:
+            body["max_tokens"] = 1
+    return body
+
+
+async def prime_prefix_cache(
+    *,
+    backend: str,
+    request_func: Callable,
+    api_url: str,
+    model_id: str,
+    input_requests: List[DatasetRow],
+    lora_names: Optional[List[str]],
+    extra_request_body: Dict[str, Any],
+) -> int:
+    """Prime each active prefix and return the number of setup requests sent."""
+    active_prefixes = get_active_cache_prefixes(input_requests)
+    if not active_prefixes:
+        print("Prefix-cache priming skipped: reusable prefix length is zero.")
+        return 0
+
+    prime_lora_names = list(dict.fromkeys(lora_names or [None]))
+    prime_request_count = len(active_prefixes) * len(prime_lora_names)
+    footprint_tokens = sum(row.cache_prefix_len or 0 for row in active_prefixes)
+    if len(prime_lora_names) > 1:
+        footprint_tokens *= len(prime_lora_names)
+    print(
+        "Priming prefix cache with "
+        f"{prime_request_count} request(s) across {len(active_prefixes)} active "
+        f"group(s), approximately {footprint_tokens} prefix tokens..."
+    )
+
+    for request in active_prefixes:
+        for lora_name in prime_lora_names:
+            prime_input = RequestFuncInput(
+                model=model_id,
+                prompt=request.cache_prefix,
+                api_url=api_url,
+                prompt_len=request.cache_prefix_len,
+                output_len=1,
+                lora_name=lora_name,
+                image_data=None,
+                extra_request_body=_prime_extra_request_body(
+                    backend,
+                    extra_request_body,
+                    request.extra_request_body or {},
+                ),
+                routing_key=request.routing_key,
+            )
+            output = await request_func(request_func_input=prime_input)
+            outputs = output if isinstance(output, list) else [output]
+            if not outputs or not all(item.success for item in outputs):
+                error = outputs[0].error if outputs else "empty response"
+                raise ValueError(
+                    "Prefix-cache priming failed for group "
+                    f"{request.cache_group_id}: {error}"
+                )
+
+    print("Prefix-cache priming completed. Starting measured benchmark run...")
+    return prime_request_count
+
+
+def build_prefix_cache_metadata(
+    input_requests: List[DatasetRow],
+    *,
+    requested_input_len: int,
+    requested_hit_rate: float,
+    requested_num_groups: int,
+    zipf_alpha: Optional[float],
+    prime_request_count: int,
+) -> Dict[str, Any]:
+    """Summarize requested and effective prefix-cache workload parameters."""
+    active_prefixes = get_active_cache_prefixes(input_requests)
+    effective_prefix_lens = [
+        request.cache_prefix_len or 0 for request in input_requests
+    ]
+    effective_prompt_lens = [request.prompt_len for request in input_requests]
+    effective_prefix_total = sum(effective_prefix_lens)
+    effective_prompt_total = sum(effective_prompt_lens)
+    prime_variants_per_group = (
+        prime_request_count // len(active_prefixes) if active_prefixes else 0
+    )
+
+    unique_effective_prefix_lens = sorted(set(effective_prefix_lens))
+    effective_prefix_tokens = (
+        unique_effective_prefix_lens[0]
+        if len(unique_effective_prefix_lens) == 1
+        else None
+    )
+    return {
+        "cache_input_mode": (
+            "text" if isinstance(input_requests[0].prompt, str) else "token_ids"
+        ),
+        "requested_cache_hit_rate": requested_hit_rate,
+        "requested_prefix_tokens": compute_prefix_len(
+            requested_input_len, requested_hit_rate
+        ),
+        "effective_prefix_tokens": effective_prefix_tokens,
+        "effective_prefix_tokens_min": min(effective_prefix_lens),
+        "effective_prefix_tokens_max": max(effective_prefix_lens),
+        "effective_prefix_tokens_mean": (
+            effective_prefix_total / len(effective_prefix_lens)
+        ),
+        "effective_input_tokens_min": min(effective_prompt_lens),
+        "effective_input_tokens_max": max(effective_prompt_lens),
+        "effective_input_tokens_mean": (
+            effective_prompt_total / len(effective_prompt_lens)
+        ),
+        "effective_cache_hit_rate": (
+            effective_prefix_total / effective_prompt_total
+            if effective_prompt_total
+            else 0.0
+        ),
+        "cache_num_groups_requested": requested_num_groups,
+        "cache_num_groups_active": len(
+            {
+                request.cache_group_id
+                for request in input_requests
+                if request.cache_group_id is not None
+            }
+        ),
+        "cache_zipf_alpha": zipf_alpha,
+        "cache_prime_request_count": prime_request_count,
+        "cache_prime_footprint_tokens": (
+            sum(request.cache_prefix_len or 0 for request in active_prefixes)
+            * prime_variants_per_group
+        ),
+        "cache_page_alignment_applied": False,
+        "page_aligned_prefix_tokens": None,
+        "page_aligned_cache_hit_rate": None,
+    }
+
+
 @dataclass
 class BenchmarkMetrics:
     # Request counts and token totals
@@ -1430,6 +1616,9 @@ async def benchmark(
         lora_name=lora_name,
         image_data=test_request.image_data,
         extra_request_body=extra_request_body,
+        routing_key=(
+            test_request.routing_key if args.dataset_name == "prefix-cache" else None
+        ),
     )
 
     # Run warmup requests
@@ -1457,13 +1646,31 @@ async def benchmark(
     # Flush cache after warmup so the measured run does not benefit from
     # request-local prefix reuse. vLLM exposes a different, development-mode
     # endpoint for the same purpose.
+    has_prefix_cache_workload = any(
+        getattr(request, "cache_group_id", None) is not None
+        for request in input_requests
+    )
     should_flush_cache = (
-        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
-    ) or flush_cache
+        ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI"))
+        or flush_cache
+        or has_prefix_cache_workload
+    )
     if should_flush_cache:
         flush_server_cache(base_url, backend, flush_cache_timeout)
 
     time.sleep(1.0)
+
+    prime_request_count = 0
+    if has_prefix_cache_workload:
+        prime_request_count = await prime_prefix_cache(
+            backend=backend,
+            request_func=request_func,
+            api_url=api_url,
+            model_id=model_id,
+            input_requests=input_requests,
+            lora_names=lora_names,
+            extra_request_body=extra_request_body,
+        )
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
@@ -1611,6 +1818,16 @@ async def benchmark(
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
     )
+    prefix_cache_metadata = None
+    if args.dataset_name == "prefix-cache":
+        prefix_cache_metadata = build_prefix_cache_metadata(
+            input_requests,
+            requested_input_len=args.random_input_len,
+            requested_hit_rate=args.cache_hit_rate,
+            requested_num_groups=args.cache_num_groups,
+            zipf_alpha=args.cache_zipf_alpha,
+            prime_request_count=prime_request_count,
+        )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -1680,6 +1897,51 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if prefix_cache_metadata is not None:
+        print("{s:{c}^{n}}".format(s="Prefix Cache Workload", n=50, c="-"))
+        print(
+            "{:<40} {:<10.4f}".format(
+                "Requested cache hit rate:",
+                prefix_cache_metadata["requested_cache_hit_rate"],
+            )
+        )
+        print(
+            "{:<40} {:<10}".format(
+                "Requested prefix tokens:",
+                prefix_cache_metadata["requested_prefix_tokens"],
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Mean effective prefix tokens:",
+                prefix_cache_metadata["effective_prefix_tokens_mean"],
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Mean effective input tokens:",
+                prefix_cache_metadata["effective_input_tokens_mean"],
+            )
+        )
+        print(
+            "{:<40} {:<10.4f}".format(
+                "Effective cache hit rate:",
+                prefix_cache_metadata["effective_cache_hit_rate"],
+            )
+        )
+        print(
+            "{:<40} {}/{}".format(
+                "Active/requested prefix groups:",
+                prefix_cache_metadata["cache_num_groups_active"],
+                prefix_cache_metadata["cache_num_groups_requested"],
+            )
+        )
+        print(
+            "{:<40} {:<10}".format(
+                "Prime footprint tokens:",
+                prefix_cache_metadata["cache_prime_footprint_tokens"],
+            )
+        )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1849,6 +2111,20 @@ async def benchmark(
                 "storage_cached_tokens": (total_storage if total_storage > 0 else None),
                 "storage_backend": storage_backend_name,
             }
+
+        if prefix_cache_metadata is not None:
+            result.update(prefix_cache_metadata)
+            result["observed_cached_tokens"] = (
+                total_cached if args.cache_report else None
+            )
+            result["observed_prompt_tokens"] = (
+                total_prompt_tokens if args.cache_report else None
+            )
+            result["observed_cache_hit_rate"] = (
+                total_cached / total_prompt_tokens
+                if args.cache_report and total_prompt_tokens
+                else None
+            )
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -1963,6 +2239,13 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "cache_report"):
         args.cache_report = False
+
+    if not hasattr(args, "cache_hit_rate"):
+        args.cache_hit_rate = 0.0
+    if not hasattr(args, "cache_num_groups"):
+        args.cache_num_groups = 1
+    if not hasattr(args, "cache_zipf_alpha"):
+        args.cache_zipf_alpha = None
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -2189,6 +2472,25 @@ def _validate_parsed_gsp_args(
         )
 
 
+def _validate_parsed_prefix_cache_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if args.dataset_name != "prefix-cache":
+        return
+    try:
+        validate_prefix_cache_config(
+            num_requests=args.num_prompts,
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            hit_rate=args.cache_hit_rate,
+            num_groups=args.cache_num_groups,
+            zipf_alpha=args.cache_zipf_alpha,
+            range_ratio=args.random_range_ratio,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, [])
@@ -2236,6 +2538,7 @@ def cli_main():
             "openai",
             "random",
             "random-ids",
+            "prefix-cache",
             "generated-shared-prefix",
             "mmmu",
             "image",
@@ -2313,20 +2616,27 @@ def cli_main():
         "--random-input-len",
         type=int,
         default=1024,
-        help="Number of input tokens per request, used only for random and image dataset.",
+        help=(
+            "Number of input tokens per request, used by random, image, and "
+            "prefix-cache datasets. For prefix-cache this is the total prompt "
+            "length, including the reusable prefix."
+        ),
     )
     parser.add_argument(
         "--random-output-len",
         default=1024,
         type=int,
-        help="Number of output tokens per request, used only for random and image dataset.",
+        help=(
+            "Number of output tokens per request, used by random, image, and "
+            "prefix-cache datasets."
+        ),
     )
     parser.add_argument(
         "--random-range-ratio",
         type=float,
         default=0.0,
         help="Range of sampled ratio of input/output length, "
-        "used only for random and image dataset.",
+        "used by random and image datasets. Prefix-cache currently requires 1.0.",
     )
     # image dataset args
     parser.add_argument(
@@ -2587,7 +2897,10 @@ def cli_main():
     parser.add_argument(
         "--flush-cache",
         action="store_true",
-        help="Flush the cache before running the benchmark",
+        help=(
+            "Flush the cache before running the benchmark. This is enabled "
+            "automatically for the prefix-cache dataset before its prime phase."
+        ),
     )
     parser.add_argument(
         "--flush-cache-timeout",
@@ -2605,6 +2918,35 @@ def cli_main():
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
+    )
+
+    group = parser.add_argument_group("prefix-cache dataset arguments")
+    group.add_argument(
+        "--cache-hit-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "Target fraction of --random-input-len supplied by a primed "
+            "shared prefix. Used only for the prefix-cache dataset."
+        ),
+    )
+    group.add_argument(
+        "--cache-num-groups",
+        type=int,
+        default=1,
+        help=(
+            "Number of distinct shared prefixes for the prefix-cache dataset. "
+            "Must be between 1 and --num-prompts."
+        ),
+    )
+    group.add_argument(
+        "--cache-zipf-alpha",
+        type=_finite_positive_float,
+        default=None,
+        help=(
+            "Optional Zipf exponent for prefix-group popularity. Omit for "
+            "uniform assignment; larger values concentrate requests on hot groups."
+        ),
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
@@ -2745,6 +3087,7 @@ def cli_main():
     )
     args = parser.parse_args()
     _validate_parsed_gsp_args(parser, args)
+    _validate_parsed_prefix_cache_args(parser, args)
     run_benchmark(args)
 
 

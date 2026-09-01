@@ -29,6 +29,9 @@ class DatasetRow:
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
+    cache_prefix: Optional[Any] = None
+    cache_prefix_len: Optional[int] = None
+    cache_group_id: Optional[int] = None
 
     def __post_init__(self):
         if self.text_prompt_len is None:
@@ -62,6 +65,21 @@ def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int
         full_len + 1,
         size=num,
     ).tolist()
+
+
+def build_zipf_group_probabilities(num_groups: int, alpha: float) -> np.ndarray:
+    """Return rank-based Zipf probabilities for prefix groups.
+
+    Group zero is the hottest group and has rank one.
+    """
+    if num_groups <= 0:
+        raise ValueError(f"num_groups must be > 0, got {num_groups}")
+    if not np.isfinite(alpha) or alpha <= 0:
+        raise ValueError(f"alpha must be a finite float > 0, got {alpha!r}")
+
+    ranks = np.arange(1, num_groups + 1, dtype=np.float64)
+    weights = 1.0 / (ranks**alpha)
+    return weights / weights.sum()
 
 
 @lru_cache(maxsize=1)
