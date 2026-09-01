@@ -16,6 +16,7 @@ from sglang.benchmark import serving
 from sglang.benchmark.datasets import DATASET_MAPPING
 from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.datasets.prefix_cache import (
+    _token_pool,
     assign_prefix_groups,
     compute_prefix_len,
     generate_prefix_cache_requests,
@@ -144,6 +145,57 @@ class TestPrefixCacheDataset(CustomTestCase):
             Counter({group_id: 1 for group_id in range(12)}),
         )
         self.assertEqual(len({tuple(row.cache_prefix) for row in per_request_rows}), 12)
+
+    def test_prefixes_use_seeded_cyclic_token_sequences(self):
+        rows = self.generate(num_groups=4, input_len=20, hit_rate=0.5)
+        token_pool = _token_pool(self.tokenizer, for_text=False)
+        token_positions = {
+            token_id: position for position, token_id in enumerate(token_pool)
+        }
+        prefixes = {}
+        for row in rows:
+            prefixes.setdefault(row.cache_group_id, row.cache_prefix)
+
+        first_tokens = [prefixes[group_id][0] for group_id in sorted(prefixes)]
+        self.assertEqual(len(first_tokens), len(set(first_tokens)))
+        for prefix in prefixes.values():
+            positions = [token_positions[token_id] for token_id in prefix]
+            for left, right in zip(positions, positions[1:]):
+                self.assertEqual(right, (left + 1) % len(token_pool))
+
+    def test_text_token_pool_excludes_byte_fallback_tokens(self):
+        vocab = {
+            "[UNK]": 0,
+            "[PAD]": 1,
+            "[BOS]": 2,
+            "[EOS]": 3,
+            "<0x41>": 4,
+            "safe_token": 5,
+        }
+        tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = Whitespace()
+        hf_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            bos_token="[BOS]",
+            eos_token="[EOS]",
+        )
+
+        self.assertEqual(_token_pool(hf_tokenizer, for_text=True), [5])
+        self.assertEqual(_token_pool(hf_tokenizer, for_text=False), [4, 5])
+
+    def test_prefix_generation_rejects_more_groups_than_tokens(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "at most 2048 prefix groups, but got 2049",
+        ):
+            self.generate(
+                num_prompts=2049,
+                input_len=2,
+                hit_rate=0.5,
+                num_groups=2049,
+            )
 
     def test_first_suffix_token_is_unique_within_each_group(self):
         # The total request count exceeds the usable vocabulary, but each group

@@ -1,4 +1,5 @@
 import math
+import re
 from argparse import Namespace
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
@@ -81,39 +82,28 @@ def assign_prefix_groups(
     )
 
 
-def _token_pool(tokenizer: PreTrainedTokenizerBase) -> List[int]:
+def _token_pool(tokenizer: PreTrainedTokenizerBase, *, for_text: bool) -> List[int]:
     available = list(dict.fromkeys(get_available_tokens(tokenizer)))
     vocab_size = getattr(tokenizer, "vocab_size", None)
     if isinstance(vocab_size, int) and vocab_size > 0:
         available = [token_id for token_id in available if token_id < vocab_size]
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-    non_special = [token_id for token_id in available if token_id not in special_ids]
-    token_ids = non_special or available
+    token_ids = [token_id for token_id in available if token_id not in special_ids]
+    if for_text:
+        byte_fallback_pattern = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
+        token_ids = [
+            token_id
+            for token_id in token_ids
+            if not byte_fallback_pattern.match(
+                tokenizer.convert_ids_to_tokens(token_id) or ""
+            )
+        ]
     if not token_ids:
         raise ValueError("Tokenizer vocabulary does not contain any integer token IDs")
     return token_ids
 
 
-def _unique_marker_width(
-    num_values: int,
-    base: int,
-    sequence_len: int,
-) -> int:
-    if num_values <= 1 or sequence_len == 0:
-        return 0
-
-    capacity = 1
-    for width in range(1, sequence_len + 1):
-        capacity *= base
-        if capacity >= num_values:
-            return width
-    raise ValueError(
-        f"Cannot generate {num_values} distinct token sequences of length "
-        f"{sequence_len} from a vocabulary of {base} usable tokens"
-    )
-
-
-def _generate_unique_sequences(
+def _generate_group_prefixes(
     *,
     count: int,
     length: int,
@@ -122,17 +112,21 @@ def _generate_unique_sequences(
 ) -> List[List[int]]:
     if length == 0:
         return [[] for _ in range(count)]
+    if count > len(token_ids):
+        raise ValueError(
+            "Prefix-cache generation supports at most "
+            f"{len(token_ids)} prefix groups, but got {count}. Reduce "
+            "--cache-num-groups."
+        )
 
-    width = _unique_marker_width(count, len(token_ids), length)
-    result = []
-    for sequence_id in range(count):
-        sequence = rng.choice(token_ids, size=length, replace=True).tolist()
-        marker = sequence_id
-        for position in range(width):
-            sequence[position] = token_ids[marker % len(token_ids)]
-            marker //= len(token_ids)
-        result.append([int(token_id) for token_id in sequence])
-    return result
+    base_offset = int(rng.integers(len(token_ids)))
+    return [
+        [
+            token_ids[(base_offset + group_id + position) % len(token_ids)]
+            for position in range(length)
+        ]
+        for group_id in range(count)
+    ]
 
 
 def _generate_group_isolated_suffixes(
@@ -207,7 +201,7 @@ def generate_prefix_cache_requests(
 ) -> List[DatasetRow]:
     prefix_len = compute_prefix_len(input_len, hit_rate)
     suffix_len = input_len - prefix_len
-    token_ids = _token_pool(tokenizer)
+    token_ids = _token_pool(tokenizer, for_text=return_text)
 
     # Keep assignment and token generation independent so changes to one do
     # not perturb the other for a fixed seed.
@@ -218,7 +212,7 @@ def generate_prefix_cache_requests(
         seed=seed,
     )
     token_rng = np.random.default_rng(seed + 1)
-    prefixes = _generate_unique_sequences(
+    prefixes = _generate_group_prefixes(
         count=num_groups,
         length=prefix_len,
         token_ids=token_ids,
