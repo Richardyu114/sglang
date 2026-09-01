@@ -94,12 +94,10 @@ def _token_pool(tokenizer: PreTrainedTokenizerBase) -> List[int]:
     return token_ids
 
 
-def _marker_width(
+def _unique_marker_width(
     num_values: int,
     base: int,
     sequence_len: int,
-    *,
-    require_distinct: bool,
 ) -> int:
     if num_values <= 1 or sequence_len == 0:
         return 0
@@ -109,31 +107,23 @@ def _marker_width(
         capacity *= base
         if capacity >= num_values:
             return width
-    if not require_distinct:
-        return sequence_len
     raise ValueError(
         f"Cannot generate {num_values} distinct token sequences of length "
         f"{sequence_len} from a vocabulary of {base} usable tokens"
     )
 
 
-def _generate_distinct_sequences(
+def _generate_unique_sequences(
     *,
     count: int,
     length: int,
     token_ids: Sequence[int],
     rng: np.random.Generator,
-    require_distinct: bool,
 ) -> List[List[int]]:
     if length == 0:
         return [[] for _ in range(count)]
 
-    width = _marker_width(
-        count,
-        len(token_ids),
-        length,
-        require_distinct=require_distinct,
-    )
+    width = _unique_marker_width(count, len(token_ids), length)
     result = []
     for sequence_id in range(count):
         sequence = rng.choice(token_ids, size=length, replace=True).tolist()
@@ -143,6 +133,43 @@ def _generate_distinct_sequences(
             marker //= len(token_ids)
         result.append([int(token_id) for token_id in sequence])
     return result
+
+
+def _generate_group_isolated_suffixes(
+    *,
+    assignments: Sequence[int],
+    length: int,
+    token_ids: Sequence[int],
+    rng: np.random.Generator,
+) -> List[List[int]]:
+    """Generate suffixes that branch immediately within each prefix group."""
+    if length == 0:
+        return [[] for _ in assignments]
+
+    suffixes = [
+        [int(token_id) for token_id in rng.choice(token_ids, size=length)]
+        for _ in assignments
+    ]
+    requests_by_group = {}
+    for request_id, group_id in enumerate(assignments):
+        requests_by_group.setdefault(int(group_id), []).append(request_id)
+
+    vocab_size = len(token_ids)
+    for group_id in sorted(requests_by_group):
+        request_ids = requests_by_group[group_id]
+        if len(request_ids) > vocab_size:
+            raise ValueError(
+                "Prefix-cache suffix isolation supports at most "
+                f"{vocab_size} requests per active prefix group, but group "
+                f"{group_id} has {len(request_ids)}. Increase "
+                "--cache-num-groups or reduce --num-prompts."
+            )
+
+        offset = int(rng.integers(vocab_size))
+        for local_index, request_id in enumerate(request_ids):
+            suffixes[request_id][0] = token_ids[(offset + local_index) % vocab_size]
+
+    return suffixes
 
 
 def _decode(tokenizer: PreTrainedTokenizerBase, token_ids: List[int]) -> str:
@@ -191,19 +218,17 @@ def generate_prefix_cache_requests(
         seed=seed,
     )
     token_rng = np.random.default_rng(seed + 1)
-    prefixes = _generate_distinct_sequences(
+    prefixes = _generate_unique_sequences(
         count=num_groups,
         length=prefix_len,
         token_ids=token_ids,
         rng=token_rng,
-        require_distinct=True,
     )
-    suffixes = _generate_distinct_sequences(
-        count=num_prompts,
+    suffixes = _generate_group_isolated_suffixes(
+        assignments=assignments,
         length=suffix_len,
         token_ids=token_ids,
         rng=token_rng,
-        require_distinct=False,
     )
 
     rows = []

@@ -145,6 +145,36 @@ class TestPrefixCacheDataset(CustomTestCase):
         )
         self.assertEqual(len({tuple(row.cache_prefix) for row in per_request_rows}), 12)
 
+    def test_first_suffix_token_is_unique_within_each_group(self):
+        # The total request count exceeds the usable vocabulary, but each group
+        # still fits. Group-local assignment should therefore isolate every
+        # suffix branch without imposing an unnecessary global limit.
+        rows = self.generate(
+            num_prompts=3000,
+            input_len=2,
+            hit_rate=0.5,
+            num_groups=2,
+        )
+        first_suffix_tokens = {}
+        for row in rows:
+            token = row.prompt[row.cache_prefix_len]
+            first_suffix_tokens.setdefault(row.cache_group_id, []).append(token)
+
+        for tokens in first_suffix_tokens.values():
+            self.assertEqual(len(tokens), len(set(tokens)))
+
+    def test_suffix_isolation_rejects_oversized_group(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "at most 2048 requests per active prefix group.*group 0 has 2049",
+        ):
+            self.generate(
+                num_prompts=2049,
+                input_len=2,
+                hit_rate=0.5,
+                num_groups=1,
+            )
+
     def test_zipf_assignment_is_deterministic_and_skewed(self):
         first = assign_prefix_groups(10_000, 4, 1.5, seed=7)
         second = assign_prefix_groups(10_000, 4, 1.5, seed=7)
